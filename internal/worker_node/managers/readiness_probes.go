@@ -100,7 +100,10 @@ func SendReadinessProbe(url string) (time.Duration, bool) {
 			tries++
 
 			res, err := httpProbingClient.Get(fmt.Sprintf("http://%s/health", url))
-			if err != nil || res == nil || (res != nil && res.StatusCode != http.StatusOK) {
+			// Benchmark-time patch: accept both 200 and 204. flash-envd's
+			// /health returns 204 (StatusNoContent), but the original probe
+			// only accepted 200. This is a read-only behavioral change.
+			if err != nil || res == nil || (res != nil && res.StatusCode != http.StatusOK && res.StatusCode != http.StatusNoContent) {
 				handleBodyClosing(res)
 
 				toSleep := expBackoff.Next()

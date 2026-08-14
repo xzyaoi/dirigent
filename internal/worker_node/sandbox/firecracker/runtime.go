@@ -37,6 +37,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 )
@@ -100,13 +101,30 @@ func NewFirecrackerRuntime(cpApi proto.CpiInterfaceClient, sandboxManager *manag
 }
 
 func (fcr *Runtime) createVMCS() *VMControlStructure {
+	sandboxID := fmt.Sprintf("firecracker-%d", fcr.idGenerator.Int())
+
+	// Benchmark-time patch: per-VM rootfs copy. Dirigent originally uses a
+	// single shared rootfs (fcr.FileSystemPath) for ALL VMs, which forces
+	// IsReadOnly: true (ext4 has no multi-writer support). We copy the
+	// rootfs per VM (cp --sparse=always) so each VM gets its own writable
+	// filesystem. The copy is ~1-2 s on NVMe for a 1.5 GiB actual rootfs;
+	// snapshots still work because the copy is identical to the original
+	// at snapshot time (no user writes before the readiness probe).
+	perVMPath := filepath.Join(os.TempDir(), fmt.Sprintf("rootfs-%s.ext4", sandboxID))
+	if err := exec.Command("cp", "--sparse=always", fcr.FileSystemPath, perVMPath).Run(); err != nil {
+		logrus.Warnf("Failed to copy rootfs for %s (%v); falling back to shared read-only", sandboxID, err)
+		perVMPath = fcr.FileSystemPath
+	} else {
+		logrus.Debugf("Copied rootfs for %s -> %s", sandboxID, perVMPath)
+	}
+
 	return &VMControlStructure{
 		Context: context.Background(),
 
 		KernelPath:     fcr.KernelPath,
-		FileSystemPath: fcr.FileSystemPath,
+		FileSystemPath: perVMPath,
 
-		SandboxID: fmt.Sprintf("firecracker-%d", fcr.idGenerator.Int()),
+		SandboxID: sandboxID,
 	}
 }
 
@@ -282,6 +300,15 @@ func (fcr *Runtime) DeleteSandbox(_ context.Context, in *proto.SandboxID) (*prot
 	fcr.NetworkManager.GiveUpNetwork(sandboxMetadata.VMCS.NetworkConfiguration)
 	// delete Firecracker logs
 	deleteLogs(sandboxMetadata.VMCS)
+
+	// Benchmark-time patch: delete the per-VM rootfs copy (see
+	// createVMCS in runtime.go). Only delete if it's not the shared
+	// rootfs (fall-back path).
+	if sandboxMetadata.VMCS.FileSystemPath != fcr.FileSystemPath {
+		if err := os.Remove(sandboxMetadata.VMCS.FileSystemPath); err != nil {
+			logrus.Warnf("Failed to delete per-VM rootfs %s: %v", sandboxMetadata.VMCS.FileSystemPath, err)
+		}
+	}
 
 	logrus.Debug("Sandbox deletion took ", time.Since(start).Microseconds(), " μs")
 	return &proto.ActionStatus{Success: true}, nil

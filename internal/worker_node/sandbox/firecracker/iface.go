@@ -65,6 +65,10 @@ func makeFirecrackerConfig(vmcs *VMControlStructure, vmDebugMode bool, metadata 
 		Drives: []models.Drive{{
 			DriveID:      firecracker.String("1"),
 			PathOnHost:   firecracker.String(vmcs.FileSystemPath),
+			// Benchmark-time patch: IsReadOnly: false. Each VM now gets its
+			// own rootfs copy (see createVMCS in runtime.go), so writes are
+			// safe. The original code had IsReadOnly: false too, but with a
+			// shared rootfs that would corrupt ext4 under concurrency.
 			IsReadOnly:   firecracker.Bool(false),
 			IsRootDevice: firecracker.Bool(true),
 		}},

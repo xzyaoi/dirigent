@@ -19,3 +19,7 @@ notes.txt
 *.pdf
 
 scripts/invitro_traces/rps/*
+*.pyc
+/worker_node
+_bench/
+_bench_pb2/

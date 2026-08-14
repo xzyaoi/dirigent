@@ -64,6 +64,16 @@ func GetCNIClient(configFile string) cni.CNI {
 }
 
 func FetchImage(ctx context.Context, client *containerd.Client, imageURL string) (containerd.Image, error) {
+	// Check the local content store first. client.Pull always resolves the
+	// reference remotely, which fails for images that exist only in the local
+	// content store (e.g. a locally-built flash-envd image imported via
+	// `ctr images import` that doesn't exist on any registry). This makes
+	// pre-imported images usable without requiring a registry round-trip;
+	// the Pull fallback is still there for images that aren't local.
+	if image, err := client.GetImage(ctx, imageURL); err == nil {
+		return image, nil
+	}
+
 	image, err := client.Pull(ctx, imageURL, containerd.WithPullUnpack)
 	if err != nil {
 		return nil, err
