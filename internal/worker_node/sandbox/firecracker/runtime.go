@@ -128,6 +128,16 @@ func (fcr *Runtime) createVMCS() *VMControlStructure {
 	}
 }
 
+// cleanupPerVMRootfs deletes the per-VM rootfs copy if it is not the
+// shared base (benchmark-time patch — see createVMCS).
+func (fcr *Runtime) cleanupPerVMRootfs(vmcs *VMControlStructure) {
+	if vmcs.FileSystemPath != fcr.FileSystemPath {
+		if err := os.Remove(vmcs.FileSystemPath); err != nil {
+			logrus.Warnf("Failed to delete per-VM rootfs %s: %v", vmcs.FileSystemPath, err)
+		}
+	}
+}
+
 func createMetadata(in *proto.ServiceInfo, vmcs *VMControlStructure) *managers.Metadata {
 	return &managers.Metadata{
 		ServiceName: in.Name,
@@ -158,6 +168,7 @@ func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*
 	err, netCreateDuration, vmCreateDuration, vmStartDuration := StartFirecrackerVM(fcr.NetworkManager, vmcs, fcr.VMDebugMode, snapshot)
 	if err != nil {
 		// resource deallocation already done in StartFirecrackerVM
+		fcr.cleanupPerVMRootfs(vmcs)
 		return &proto.SandboxCreationStatus{Success: false}, err
 	}
 
@@ -171,6 +182,7 @@ func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*
 	if err != nil {
 		fcr.NetworkManager.GiveUpNetwork(vmcs.NetworkConfiguration)
 		containerd.UnassignPort(metadata.HostPort)
+		fcr.cleanupPerVMRootfs(vmcs)
 
 		logrus.Debugf("Failed to get PID of the virtual machine - %v", err)
 		return &proto.SandboxCreationStatus{Success: false}, err
@@ -191,10 +203,12 @@ func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*
 
 	in.PortForwarding.HostPort = int32(metadata.HostPort)
 
-	logrus.Debug("Worker node part: ", time.Since(start).Milliseconds(), " ms")
+	logrus.Infof("[BENCH] create %s: before readiness probe (ipt=%v)", vmcs.SandboxID, iptablesDuration)
 
 	// blocking call
 	timeToPass, passed := managers.SendReadinessProbe(fmt.Sprintf("localhost:%d", metadata.HostPort))
+
+	logrus.Infof("[BENCH] create %s: readiness probe passed=%v took=%v", vmcs.SandboxID, passed, timeToPass)
 
 	// create a snapshot for the service if it does not exist
 	startSnapshotCreation := time.Now()
@@ -217,7 +231,10 @@ func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*
 	}
 	snapshotCreationDuration := time.Since(startSnapshotCreation)
 
+	logrus.Infof("[BENCH] create %s: after snapshot block passed=%v useSnap=%v", vmcs.SandboxID, passed, fcr.UseSnapshots)
+
 	if passed {
+		logrus.Infof("[BENCH] create %s: RETURNING success", vmcs.SandboxID)
 		return &proto.SandboxCreationStatus{
 			Success:      true,
 			ID:           vmcs.SandboxID,
@@ -302,13 +319,8 @@ func (fcr *Runtime) DeleteSandbox(_ context.Context, in *proto.SandboxID) (*prot
 	deleteLogs(sandboxMetadata.VMCS)
 
 	// Benchmark-time patch: delete the per-VM rootfs copy (see
-	// createVMCS in runtime.go). Only delete if it's not the shared
-	// rootfs (fall-back path).
-	if sandboxMetadata.VMCS.FileSystemPath != fcr.FileSystemPath {
-		if err := os.Remove(sandboxMetadata.VMCS.FileSystemPath); err != nil {
-			logrus.Warnf("Failed to delete per-VM rootfs %s: %v", sandboxMetadata.VMCS.FileSystemPath, err)
-		}
-	}
+	// createVMCS / cleanupPerVMRootfs in runtime.go).
+	fcr.cleanupPerVMRootfs(sandboxMetadata.VMCS)
 
 	logrus.Debug("Sandbox deletion took ", time.Since(start).Microseconds(), " μs")
 	return &proto.ActionStatus{Success: true}, nil

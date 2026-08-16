@@ -28,6 +28,7 @@ import (
 	"cluster_manager/api/proto"
 	"cluster_manager/internal/worker_node"
 	"context"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -44,7 +45,13 @@ func NewWorkerNodeApi(workerNode *worker_node.WorkerNode) *WnApiServer {
 }
 
 func (w *WnApiServer) CreateSandbox(grpcCtx context.Context, in *proto.ServiceInfo) (*proto.SandboxCreationStatus, error) {
-	return w.workerNode.SandboxRuntime.CreateSandbox(grpcCtx, in)
+	st, err := w.workerNode.SandboxRuntime.CreateSandbox(grpcCtx, in)
+	if st != nil {
+		logrus.Infof("[BENCH] API CreateSandbox returning: success=%v id=%s err=%v", st.Success, st.ID, err)
+	} else {
+		logrus.Infof("[BENCH] API CreateSandbox returning: st=nil err=%v", err)
+	}
+	return st, err
 }
 
 func (w *WnApiServer) DeleteSandbox(grpcCtx context.Context, in *proto.SandboxID) (*proto.ActionStatus, error) {
