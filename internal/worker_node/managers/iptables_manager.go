@@ -50,16 +50,11 @@ func AddRules(ipt *iptables.IPTables, sourcePort int, destIP string, destPort in
 	}
 	logrus.Debugf("Added IP table rule for external traffic any:%d -> %s:%d", sourcePort, destIP, destPort)
 
-	err = ipt.Append(
-		"nat",
-		"OUTPUT",
-		"-p", "tcp", "-o", "lo", "--dport", strconv.Itoa(sourcePort), "-j", "DNAT",
-		"--to-destination", fmt.Sprintf("%s:%d", destIP, destPort),
-	)
-	if err != nil {
-		logrus.Errorf("Error adding an OUTPUT rule for %d->%s:%d - %s", sourcePort, destIP, destPort, err.Error())
-	}
-	logrus.Debugf("Added IP table rule for localhost traffic any:%d -> %s:%d", sourcePort, destIP, destPort)
+	// OUTPUT DNAT intentionally omitted: the kernel's ip_route_me_harder()
+	// cannot re-route a locally-generated packet (source 127.0.0.1) onto a
+	// non-loopback interface, so an iptables OUTPUT-DNAT for localhost->VM
+	// traffic silently fails.  A userspace TCP forwarder (see forwarder.go)
+	// replaces it.
 
 	err = ipt.AppendUnique(
 		"nat",
@@ -87,15 +82,8 @@ func DeleteRules(ipt *iptables.IPTables, sourcePort int, destIP string, destPort
 		logrus.Errorf("Error deleting a PREROUTING rule for %d->%s:%d - %s", sourcePort, destIP, destPort, err.Error())
 	}
 
-	err = ipt.Delete(
-		"nat",
-		"OUTPUT",
-		"-p", "tcp", "-o", "lo", "--dport", strconv.Itoa(sourcePort), "-j", "DNAT",
-		"--to-destination", fmt.Sprintf("%s:%d", destIP, destPort),
-	)
-	if err != nil {
-		logrus.Errorf("Error deleting an OUTPUT rule for %d->%s:%d - %s", sourcePort, destIP, destPort, err.Error())
-	}
+	// OUTPUT DNAT rule intentionally not deleted (see AddRules comment).
+	// A userspace TCP forwarder (forwarder.go) handles localhost traffic.
 
 	// TODO: make sure it's deleted only after the last sandbox is deleted
 	/*err = ipt.Delete(

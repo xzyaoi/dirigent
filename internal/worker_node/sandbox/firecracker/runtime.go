@@ -39,6 +39,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,12 +55,16 @@ type Runtime struct {
 
 	KernelPath     string
 	FileSystemPath string
+	ImageRootfsDir string // benchmark-time: per-image rootfs dir (imageRootfsFor)
 	NetworkManager *NetworkPoolManager
 
 	SandboxManager  *managers.SandboxManager
 	ProcessMonitor  *managers.ProcessMonitor
 	SnapshotManager *SnapshotManager
 	IPT             *iptables.IPTables
+
+	forwarders     map[string]*tcpForwarder
+	forwarderMutex sync.Mutex
 }
 
 type FirecrackerMetadata struct {
@@ -68,7 +74,8 @@ type FirecrackerMetadata struct {
 }
 
 func NewFirecrackerRuntime(cpApi proto.CpiInterfaceClient, sandboxManager *managers.SandboxManager,
-	kernelPath string, fileSystemPath string, internalIPPrefix string, externalIPPrefix string,
+	kernelPath string, fileSystemPath string, imageRootfsDir string,
+	internalIPPrefix string, externalIPPrefix string,
 	vmDebugMode bool, useSnapshots bool, networkPoolSize int) *Runtime {
 
 	DeleteAllSnapshots()
@@ -91,31 +98,72 @@ func NewFirecrackerRuntime(cpApi proto.CpiInterfaceClient, sandboxManager *manag
 
 		KernelPath:     kernelPath,
 		FileSystemPath: fileSystemPath,
+		ImageRootfsDir: imageRootfsDir,
 		NetworkManager: NewNetworkPoolManager(internalIPPrefix, externalIPPrefix, networkPoolSize),
 
 		SandboxManager:  sandboxManager,
 		ProcessMonitor:  managers.NewProcessMonitor(),
 		SnapshotManager: NewFirecrackerSnapshotManager(),
 		IPT:             ipt,
+
+		forwarders: make(map[string]*tcpForwarder),
 	}
 }
 
-func (fcr *Runtime) createVMCS() *VMControlStructure {
+// imageRootfsFor selects the per-image rootfs source for a sandbox, based
+// on the image tag in the CreateSandbox request (in.Image). Benchmark-time
+// patch: Dirigent originally boots every VM from the single configured
+// firecrackerFileSystem and uses in.Image only as a snapshot-cache key
+// (runtime.go FindSnapshot/AddSnapshot). To let each lane boot the SWE-bench
+// repo its commands were recorded against (see replay_symmetric_mismatch.py)
+// instead of every VM sharing one rootfs, ImageRootfsDir is scanned for a
+// rootfs file named after the image's repo:
+//
+//	ghcr.io/swe-images/sympy_final:5289eeb...  ->  <ImageRootfsDir>/rootfs-sympy_final.ext4
+//
+// If ImageRootfsDir is empty or no matching rootfs exists, the worker's
+// default FileSystemPath is used (Dirigent's original behavior), so the
+// patch degrades gracefully when per-image rootfs files are absent.
+func (fcr *Runtime) imageRootfsFor(image string) string {
+	if fcr.ImageRootfsDir == "" || image == "" {
+		return fcr.FileSystemPath
+	}
+	repo := image
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		repo = repo[i+1:]
+	}
+	if i := strings.Index(repo, ":"); i >= 0 {
+		repo = repo[:i]
+	}
+	candidate := filepath.Join(fcr.ImageRootfsDir, "rootfs-"+repo+".ext4")
+	if _, err := os.Stat(candidate); err == nil {
+		logrus.Infof("[BENCH] per-image rootfs for %s -> %s", image, candidate)
+		return candidate
+	}
+	logrus.Warnf("no per-image rootfs for %s (looked for %s); using default %s",
+		image, candidate, fcr.FileSystemPath)
+	return fcr.FileSystemPath
+}
+
+func (fcr *Runtime) createVMCS(image string) *VMControlStructure {
 	sandboxID := fmt.Sprintf("firecracker-%d", fcr.idGenerator.Int())
 
-	// Benchmark-time patch: per-VM rootfs copy. Dirigent originally uses a
-	// single shared rootfs (fcr.FileSystemPath) for ALL VMs, which forces
-	// IsReadOnly: true (ext4 has no multi-writer support). We copy the
-	// rootfs per VM (cp --sparse=always) so each VM gets its own writable
-	// filesystem. The copy is ~1-2 s on NVMe for a 1.5 GiB actual rootfs;
-	// snapshots still work because the copy is identical to the original
-	// at snapshot time (no user writes before the readiness probe).
+	// Benchmark-time patch: per-VM, per-image rootfs copy. The source rootfs
+	// is selected by imageRootfsFor(in.Image) — the SWE-bench repo the lane
+	// was recorded against — and copied per VM (cp --sparse=always) so each
+	// VM gets its own writable filesystem (ext4 has no multi-writer support,
+	// which is why Dirigent's original shared rootfs is read-only). The copy
+	// is ~1-2 s on NVMe for a 1.5 GiB rootfs (larger for the sympy image);
+	// snapshots still work because the copy is identical to the source at
+	// snapshot time (no user writes before the readiness probe).
+	sourcePath := fcr.imageRootfsFor(image)
+
 	perVMPath := filepath.Join(os.TempDir(), fmt.Sprintf("rootfs-%s.ext4", sandboxID))
-	if err := exec.Command("cp", "--sparse=always", fcr.FileSystemPath, perVMPath).Run(); err != nil {
+	if err := exec.Command("cp", "--sparse=always", sourcePath, perVMPath).Run(); err != nil {
 		logrus.Warnf("Failed to copy rootfs for %s (%v); falling back to shared read-only", sandboxID, err)
-		perVMPath = fcr.FileSystemPath
+		perVMPath = sourcePath
 	} else {
-		logrus.Debugf("Copied rootfs for %s -> %s", sandboxID, perVMPath)
+		logrus.Debugf("Copied rootfs for %s (%s) -> %s", sandboxID, sourcePath, perVMPath)
 	}
 
 	return &VMControlStructure{
@@ -156,7 +204,7 @@ func createMetadata(in *proto.ServiceInfo, vmcs *VMControlStructure) *managers.M
 func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*proto.SandboxCreationStatus, error) {
 	start := time.Now()
 
-	vmcs := fcr.createVMCS()
+	vmcs := fcr.createVMCS(in.Image)
 
 	startFindSnapshot := time.Now()
 	snapshot, _ := fcr.SnapshotManager.FindSnapshot(in.Image)
@@ -196,6 +244,17 @@ func (fcr *Runtime) CreateSandbox(ctx context.Context, in *proto.ServiceInfo) (*
 	iptablesStart := time.Now()
 	managers.AddRules(fcr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)
 	iptablesDuration := time.Since(iptablesStart)
+
+	// Start a TCP forwarder for localhost->VM traffic (replaces iptables
+	// OUTPUT DNAT which fails on Linux 6.x — see forwarder.go).
+	fwd, fwdErr := newTCPForwarder(fmt.Sprintf("127.0.0.1:%d", metadata.HostPort), fmt.Sprintf("%s:%d", metadata.IP, metadata.GuestPort))
+	if fwdErr != nil {
+		logrus.Errorf("Failed to start TCP forwarder for sandbox %s: %v", vmcs.SandboxID, fwdErr)
+	} else {
+		fcr.forwarderMutex.Lock()
+		fcr.forwarders[vmcs.SandboxID] = fwd
+		fcr.forwarderMutex.Unlock()
+	}
 
 	go containerd.WatchExitChannel(fcr.cpApi, metadata, func(metadata *managers.Metadata) string {
 		return metadata.RuntimeMetadata.(FirecrackerMetadata).VMCS.SandboxID
@@ -301,6 +360,14 @@ func (fcr *Runtime) DeleteSandbox(_ context.Context, in *proto.SandboxID) (*prot
 	start := time.Now()
 
 	sandboxMetadata := metadata.RuntimeMetadata.(FirecrackerMetadata)
+
+	// stop the TCP forwarder for this sandbox
+	fcr.forwarderMutex.Lock()
+	if fwd, ok := fcr.forwarders[in.ID]; ok {
+		fwd.Close()
+		delete(fcr.forwarders, in.ID)
+	}
+	fcr.forwarderMutex.Unlock()
 
 	// delete networking rules
 	managers.DeleteRules(fcr.IPT, metadata.HostPort, metadata.IP, metadata.GuestPort)

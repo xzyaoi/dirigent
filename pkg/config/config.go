@@ -79,6 +79,7 @@ type WorkerNodeConfig struct {
 
 	FirecrackerKernel           string `mapstructure:"firecrackerKernel"`
 	FirecrackerFileSystem       string `mapstructure:"firecrackerFileSystem"`
+	FirecrackerImageRootfsDir   string `mapstructure:"firecrackerImageRootfsDir"`
 	FirecrackerInternalIPPrefix string `mapstructure:"firecrackerInternalIPPrefix"`
 	FirecrackerExposedIPPrefix  string `mapstructure:"firecrackerExposedIPPrefix"`
 	FirecrackerVMDebugMode      bool   `mapstructure:"firecrackerVMDebugMode"`
