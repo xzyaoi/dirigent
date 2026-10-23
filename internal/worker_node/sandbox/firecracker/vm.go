@@ -47,6 +47,7 @@ type VMControlStructure struct {
 
 	KernelPath     string
 	FileSystemPath string
+	OwnsRootfs     bool
 
 	HostPort  int
 	GuestPort int

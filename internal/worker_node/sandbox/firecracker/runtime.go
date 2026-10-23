@@ -111,7 +111,7 @@ func NewFirecrackerRuntime(cpApi proto.CpiInterfaceClient, sandboxManager *manag
 }
 
 // imageRootfsFor selects the per-image rootfs source for a sandbox, based
-// on the image tag in the CreateSandbox request (in.Image). Benchmark-time
+// on the image reference in the CreateSandbox request (in.Image). Benchmark-time
 // patch: Dirigent originally boots every VM from the single configured
 // firecrackerFileSystem and uses in.Image only as a snapshot-cache key
 // (runtime.go FindSnapshot/AddSnapshot). To let each lane boot the SWE-bench
@@ -119,7 +119,8 @@ func NewFirecrackerRuntime(cpApi proto.CpiInterfaceClient, sandboxManager *manag
 // instead of every VM sharing one rootfs, ImageRootfsDir is scanned for a
 // rootfs file named after the image's repo:
 //
-//	ghcr.io/swe-images/sympy_final:5289eeb...  ->  <ImageRootfsDir>/rootfs-sympy_final.ext4
+//	ghcr.io/swe-images/sympy_final:5289eeb... -> <dir>/rootfs-sympy_final.ext4
+//	ghcr.io/swe-images/sympy_final@sha256:abc -> <dir>/rootfs-sympy_final-abc.ext4
 //
 // If ImageRootfsDir is empty or no matching rootfs exists, the worker's
 // default FileSystemPath is used (Dirigent's original behavior), so the
@@ -128,14 +129,8 @@ func (fcr *Runtime) imageRootfsFor(image string) string {
 	if fcr.ImageRootfsDir == "" || image == "" {
 		return fcr.FileSystemPath
 	}
-	repo := image
-	if i := strings.LastIndex(repo, "/"); i >= 0 {
-		repo = repo[i+1:]
-	}
-	if i := strings.Index(repo, ":"); i >= 0 {
-		repo = repo[:i]
-	}
-	candidate := filepath.Join(fcr.ImageRootfsDir, "rootfs-"+repo+".ext4")
+	key := imageRootfsKey(image)
+	candidate := filepath.Join(fcr.ImageRootfsDir, "rootfs-"+key+".ext4")
 	if _, err := os.Stat(candidate); err == nil {
 		logrus.Infof("[BENCH] per-image rootfs for %s -> %s", image, candidate)
 		return candidate
@@ -145,6 +140,28 @@ func (fcr *Runtime) imageRootfsFor(image string) string {
 	return fcr.FileSystemPath
 }
 
+// imageRootfsKey preserves immutable image identity in benchmark rootfs names.
+// Tag references retain the legacy per-repository key for compatibility;
+// digest references use repo-fullDigest so two task-specific images from the
+// same repository never collapse onto one representative filesystem.
+func imageRootfsKey(image string) string {
+	ref := image
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		ref = ref[i+1:]
+	}
+	if i := strings.Index(ref, "@sha256:"); i >= 0 {
+		repo := ref[:i]
+		digest := ref[i+len("@sha256:"):]
+		if repo != "" && digest != "" {
+			return repo + "-" + digest
+		}
+	}
+	if i := strings.Index(ref, ":"); i >= 0 {
+		ref = ref[:i]
+	}
+	return ref
+}
+
 func (fcr *Runtime) createVMCS(image string) *VMControlStructure {
 	sandboxID := fmt.Sprintf("firecracker-%d", fcr.idGenerator.Int())
 
@@ -152,18 +169,32 @@ func (fcr *Runtime) createVMCS(image string) *VMControlStructure {
 	// is selected by imageRootfsFor(in.Image) — the SWE-bench repo the lane
 	// was recorded against — and copied per VM (cp --sparse=always) so each
 	// VM gets its own writable filesystem (ext4 has no multi-writer support,
-	// which is why Dirigent's original shared rootfs is read-only). The copy
-	// is ~1-2 s on NVMe for a 1.5 GiB rootfs (larger for the sympy image);
-	// snapshots still work because the copy is identical to the source at
-	// snapshot time (no user writes before the readiness probe).
+	// which is why Dirigent's original shared rootfs is read-only). On the
+	// benchmark XFS volume this is a metadata-only CoW reflink; snapshots still
+	// work because the clone is identical to the source before user writes.
 	sourcePath := fcr.imageRootfsFor(image)
 
-	perVMPath := filepath.Join(os.TempDir(), fmt.Sprintf("rootfs-%s.ext4", sandboxID))
-	if err := exec.Command("cp", "--sparse=always", sourcePath, perVMPath).Run(); err != nil {
-		logrus.Warnf("Failed to copy rootfs for %s (%v); falling back to shared read-only", sandboxID, err)
-		perVMPath = sourcePath
+	// Keep the per-VM clone on the same filesystem as its exact source so XFS
+	// can create a metadata-only CoW reflink. /tmp is commonly a different
+	// ext4 filesystem and silently turns this into a multi-GiB byte copy.
+	instanceDir := filepath.Join(filepath.Dir(sourcePath), ".instances")
+	_ = os.MkdirAll(instanceDir, 0o755)
+	perVMPath := filepath.Join(instanceDir, fmt.Sprintf("rootfs-%s.ext4", sandboxID))
+	ownsRootfs := true
+	if out, err := exec.Command("cp", "--reflink=always", "--sparse=auto", sourcePath, perVMPath).CombinedOutput(); err != nil {
+		// Preserve upstream compatibility for non-benchmark roots. The benchmark
+		// fails closed by checking logs for this fallback before accepting a run.
+		fallback := filepath.Join(os.TempDir(), fmt.Sprintf("rootfs-%s.ext4", sandboxID))
+		if copyErr := exec.Command("cp", "--sparse=always", sourcePath, fallback).Run(); copyErr != nil {
+			logrus.Warnf("Failed to reflink rootfs for %s (%v: %s) and fallback copy failed (%v); using shared read-only", sandboxID, err, strings.TrimSpace(string(out)), copyErr)
+			perVMPath = sourcePath
+			ownsRootfs = false
+		} else {
+			logrus.Warnf("[BENCH] reflink unavailable for %s (%v: %s); used byte-copy fallback %s", sandboxID, err, strings.TrimSpace(string(out)), fallback)
+			perVMPath = fallback
+		}
 	} else {
-		logrus.Debugf("Copied rootfs for %s (%s) -> %s", sandboxID, sourcePath, perVMPath)
+		logrus.Infof("[BENCH] reflink rootfs for %s (%s) -> %s", sandboxID, sourcePath, perVMPath)
 	}
 
 	return &VMControlStructure{
@@ -171,6 +202,7 @@ func (fcr *Runtime) createVMCS(image string) *VMControlStructure {
 
 		KernelPath:     fcr.KernelPath,
 		FileSystemPath: perVMPath,
+		OwnsRootfs:     ownsRootfs,
 
 		SandboxID: sandboxID,
 	}
@@ -179,7 +211,7 @@ func (fcr *Runtime) createVMCS(image string) *VMControlStructure {
 // cleanupPerVMRootfs deletes the per-VM rootfs copy if it is not the
 // shared base (benchmark-time patch — see createVMCS).
 func (fcr *Runtime) cleanupPerVMRootfs(vmcs *VMControlStructure) {
-	if vmcs.FileSystemPath != fcr.FileSystemPath {
+	if vmcs.OwnsRootfs {
 		if err := os.Remove(vmcs.FileSystemPath); err != nil {
 			logrus.Warnf("Failed to delete per-VM rootfs %s: %v", vmcs.FileSystemPath, err)
 		}
